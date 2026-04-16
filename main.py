@@ -4,7 +4,6 @@ import sqlite3
 import time
 import random
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
 
 DB_PATH = "/tmp/profiles.db"
 
@@ -78,16 +77,25 @@ def row_to_dict(r):
         "created_at": r[9]
     }
 
-# --- MAIN HANDLER (Vercel expects this) ---
-def handler(event, context):
+def response(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+        },
+        "body": json.dumps(body)
+    }
 
-    method = event.get("httpMethod", "GET")
-    path = urlparse(event.get("path", "/")).path
-    body = event.get("body")
-    query = parse_qs(event.get("queryStringParameters") or {})
+# --- VERCEL ENTRYPOINT ---
+def handler(request):
 
-    # Parse JSON body
+    method = request.get("method")
+    path = request.get("path")
+
+    # body parsing (Vercel sends raw string)
     try:
+        body = request.get("body")
         data = json.loads(body) if body else {}
     except:
         data = {}
@@ -142,7 +150,7 @@ def handler(event, context):
             }
         })
 
-    # ---------------- GET ALL PROFILES ----------------
+    # ---------------- GET ALL ----------------
     if method == "GET" and path == "/main":
         cursor.execute("SELECT * FROM profiles")
         rows = cursor.fetchall()
@@ -182,15 +190,3 @@ def handler(event, context):
         return response(204, {})
 
     return response(404, {"status": "error", "message": "Route not found"})
-
-
-# --- RESPONSE HELPER ---
-def response(status, body):
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-        },
-        "body": json.dumps(body)
-    }
