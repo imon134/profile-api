@@ -104,12 +104,12 @@ def row_to_dict(r):
         "created_at": r[9]
     }
 
-# --- HANDLER ---
+
 
 class handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
-        if self.path != "main":
+        if self.path != "/main":
             return error(self, 404, "Profile not found")
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -178,7 +178,7 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
 
-        if parsed.path.startswith("main"):
+        if parsed.path.startswith("/main"):
             pid = parsed.path.split("/")[-1]
 
             cursor.execute("SELECT * FROM profiles WHERE id=?", (pid,))
@@ -192,7 +192,7 @@ class handler(BaseHTTPRequestHandler):
                 "data": row_to_dict(row)
             })
 
-        if parsed.path == "main":
+        if parsed.path == "/main":
             params = urllib.parse.parse_qs(parsed.query)
 
             gender = params.get("gender", [None])[0]
@@ -237,7 +237,7 @@ class handler(BaseHTTPRequestHandler):
         return error(self, 404, "Profile not found")
 
     def do_DELETE(self):
-        if not self.path.startswith("main"):
+        if not self.path.startswith("/main"):
             return error(self, 404, "Profile not found")
 
         pid = self.path.split("/")[-1]
