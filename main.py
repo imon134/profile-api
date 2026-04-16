@@ -1,14 +1,14 @@
 import httpx
 import json
 import sqlite3
-import urllib.parse
+import time
+import random
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler
-import time, random
+from urllib.parse import urlparse, parse_qs
 
 DB_PATH = "/tmp/profiles.db"
 
-# DB INIT
+# --- DB INIT ---
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS profiles (
 conn.commit()
 
 # --- HELPERS ---
-
 def uuid_v7():
     ts = int(time.time() * 1000)
     rand = random.getrandbits(48)
@@ -47,37 +46,12 @@ def age_group(age):
         return "adult"
     return "senior"
 
-def send_json(handler, code, payload):
-    handler.send_response(code)
-    handler.send_header("Content-type", "application/json")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
-    handler.wfile.write(bytes(json.dumps(payload), "utf8"))
-
-def error(handler, code, message):
-    send_json(handler, code, {
-        "status": "error",
-        "message": message
-    })
-
 def fetch_external(name):
-    try:
-        g = httpx.get("https://api.genderize.io", params={"name": name}).json()
-        a = httpx.get("https://api.agify.io", params={"name": name}).json()
-        n = httpx.get("https://api.nationalize.io", params={"name": name}).json()
-    except Exception:
-        raise (502, "Upstream failure")
-
-    if not g.get("gender") or g.get("count") == 0:
-        raise (502, "Genderize returned an invalid response")
-
-    if a.get("age") is None:
-        raise (502, "Agify returned an invalid response")
+    g = httpx.get("https://api.genderize.io", params={"name": name}).json()
+    a = httpx.get("https://api.agify.io", params={"name": name}).json()
+    n = httpx.get("https://api.nationalize.io", params={"name": name}).json()
 
     countries = n.get("country", [])
-    if not countries:
-        raise (502, "Nationalize returned an invalid response")
-
     top = max(countries, key=lambda x: x["probability"])
 
     return {
@@ -104,47 +78,40 @@ def row_to_dict(r):
         "created_at": r[9]
     }
 
-# --- HANDLER ---
+# --- MAIN HANDLER (Vercel expects this) ---
+def handler(event, context):
 
-class handler(BaseHTTPRequestHandler):
+    method = event.get("httpMethod", "GET")
+    path = urlparse(event.get("path", "/")).path
+    body = event.get("body")
+    query = parse_qs(event.get("queryStringParameters") or {})
 
-    def do_POST(self):
-        if self.path != "/api/profiles":
-            return error(self, 404, "Profile not found")
+    # Parse JSON body
+    try:
+        data = json.loads(body) if body else {}
+    except:
+        data = {}
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-
-        try:
-            data = json.loads(body)
-        except:
-            return error(self, 422, "Invalid type")
-
+    # ---------------- CREATE PROFILE ----------------
+    if method == "POST" and path == "/main":
         name = data.get("name")
 
-        if not isinstance(name, str):
-            return error(self, 422, "Invalid type")
+        if not isinstance(name, str) or not name.strip():
+            return response(422, {"status": "error", "message": "Invalid name"})
 
         name = name.strip().lower()
-
-        if not name:
-            return error(self, 400, "Missing or empty name")
 
         cursor.execute("SELECT * FROM profiles WHERE name=?", (name,))
         existing = cursor.fetchone()
 
         if existing:
-            return send_json(self, 200, {
+            return response(200, {
                 "status": "success",
                 "message": "Profile already exists",
                 "data": row_to_dict(existing)
             })
 
-        try:
-            ext = fetch_external(name)
-        except Exception as e:
-            code, msg = e.args if len(e.args) == 2 else (502, "Upstream failure")
-            return error(self, code, msg)
+        ext = fetch_external(name)
 
         pid = uuid_v7()
         created_at = now_iso()
@@ -165,7 +132,7 @@ class handler(BaseHTTPRequestHandler):
         ))
         conn.commit()
 
-        return send_json(self, 201, {
+        return response(201, {
             "status": "success",
             "data": {
                 "id": pid,
@@ -175,80 +142,55 @@ class handler(BaseHTTPRequestHandler):
             }
         })
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
+    # ---------------- GET ALL PROFILES ----------------
+    if method == "GET" and path == "/main":
+        cursor.execute("SELECT * FROM profiles")
+        rows = cursor.fetchall()
 
-        if parsed.path.startswith("/api/profiles/"):
-            pid = parsed.path.split("/")[-1]
+        return response(200, {
+            "status": "success",
+            "count": len(rows),
+            "data": [row_to_dict(r) for r in rows]
+        })
 
-            cursor.execute("SELECT * FROM profiles WHERE id=?", (pid,))
-            row = cursor.fetchone()
+    # ---------------- GET BY ID ----------------
+    if method == "GET" and path.startswith("/main/"):
+        pid = path.split("/")[-1]
 
-            if not row:
-                return error(self, 404, "Profile not found")
+        cursor.execute("SELECT * FROM profiles WHERE id=?", (pid,))
+        row = cursor.fetchone()
 
-            return send_json(self, 200, {
-                "status": "success",
-                "data": row_to_dict(row)
-            })
+        if not row:
+            return response(404, {"status": "error", "message": "Profile not found"})
 
-        if parsed.path == "/api/profiles":
-            params = urllib.parse.parse_qs(parsed.query)
+        return response(200, {
+            "status": "success",
+            "data": row_to_dict(row)
+        })
 
-            gender = params.get("gender", [None])[0]
-            country = params.get("country_id", [None])[0]
-            age_g = params.get("age_group", [None])[0]
-
-            query = "SELECT id, name, gender, age, age_group, country_id FROM profiles WHERE 1=1"
-            values = []
-
-            if gender:
-                query += " AND LOWER(gender)=?"
-                values.append(gender.lower())
-
-            if country:
-                query += " AND LOWER(country_id)=?"
-                values.append(country.lower())
-
-            if age_g:
-                query += " AND LOWER(age_group)=?"
-                values.append(age_g.lower())
-
-            cursor.execute(query, values)
-            rows = cursor.fetchall()
-
-            data = [
-                {
-                    "id": r[0],
-                    "name": r[1],
-                    "gender": r[2],
-                    "age": r[3],
-                    "age_group": r[4],
-                    "country_id": r[5]
-                } for r in rows
-            ]
-
-            return send_json(self, 200, {
-                "status": "success",
-                "count": len(data),
-                "data": data
-            })
-
-        return error(self, 404, "Profile not found")
-
-    def do_DELETE(self):
-        if not self.path.startswith("/api/profiles/"):
-            return error(self, 404, "Profile not found")
-
-        pid = self.path.split("/")[-1]
+    # ---------------- DELETE ----------------
+    if method == "DELETE" and path.startswith("/main/"):
+        pid = path.split("/")[-1]
 
         cursor.execute("SELECT * FROM profiles WHERE id=?", (pid,))
         if not cursor.fetchone():
-            return error(self, 404, "Profile not found")
+            return response(404, {"status": "error", "message": "Profile not found"})
 
         cursor.execute("DELETE FROM profiles WHERE id=?", (pid,))
         conn.commit()
 
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        return response(204, {})
+
+    return response(404, {"status": "error", "message": "Route not found"})
+
+
+# --- RESPONSE HELPER ---
+def response(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+        },
+        "body": json.dumps(body)
+    }
